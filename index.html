@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GotU</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#006a66">
+<style>
+:root{--bg:#f4faf9;--card:#fff;--fg:#14201f;--mut:#5b6b69;--pri:#006a66;--pri2:#2f6a9b;--onpri:#fff;--bd:#dbe5e3}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1514;--card:#17201f;--fg:#e6efed;--mut:#9fb0ad;--pri:#7fd6cf;--pri2:#9ccbfb;--onpri:#06201e;--bd:#2a3736}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;padding:16px 16px 96px;max-width:560px;margin-inline:auto}
+h1{margin:0;font-size:28px}
+.mut{color:var(--mut)}
+.lbl{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);font-weight:600}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:24px;padding:20px;margin-top:16px;box-shadow:0 1px 4px #0001}
+.next{background:linear-gradient(135deg,var(--pri),var(--pri2));color:var(--onpri);border:0;border-radius:28px;padding:24px;margin-top:16px}
+.next .lbl{color:var(--onpri)}
+.big{font-size:38px;font-weight:700;margin:4px 0}
+.st{font-size:20px;font-weight:600;margin:6px 0}
+.row{display:flex;gap:12px;align-items:center}
+.row.sp{justify-content:space-between}
+button{font:inherit;min-height:48px;border-radius:24px;border:1px solid var(--pri);background:transparent;color:var(--pri);padding:0 18px;cursor:pointer}
+button.fill{background:var(--pri);color:var(--onpri)}
+.row>button.flex{flex:1}
+.bar{height:10px;border-radius:5px;background:var(--bd);margin-top:8px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--pri);transition:width .6s}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--bd);padding-bottom:env(safe-area-inset-bottom)}
+nav button{flex:1;border:0;border-radius:0;min-height:60px;color:var(--mut)}
+nav button.on{color:var(--pri);font-weight:700}
+.step button{width:48px;padding:0}
+.step b{min-width:92px;text-align:center}
+.warn{border-color:#c77d00}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<nav>
+  <button id="t0" onclick="tab(0)">🏠<br>Home</button>
+  <button id="t1" onclick="tab(1)">🕘<br>History</button>
+  <button id="t2" onclick="tab(2)">⚙️<br>Settings</button>
+</nav>
+<script>
+const MIN = 6e4, KEY = 'gotu.v1';
+const T = { WATER: ['💧', 'Water'], EYE_DROPS: ['👁', 'Eye Drops'] };
+const DEF = { startHour: 8, endHour: 22, intervalMin: 60, snoozeMin: 10, graceMin: 15, missedAfterMin: 30 };
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const fmt = t => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const isActive = r => r.status === 'PENDING' || r.status === 'SNOOZED';
+const ready = 'serviceWorker' in navigator ? navigator.serviceWorker.ready : null;
+
+let st, tabIdx = 0;
+try { st = JSON.parse(localStorage[KEY]); } catch (e) {}
+st = st || { cfg: { ...DEF }, track: Date.now(), rows: [], nid: 1 };
+function save() {
+  const old = Date.now() - 14 * 864e5;
+  st.rows = st.rows.filter(r => r.at > old);
+  try { localStorage[KEY] = JSON.stringify(st); } catch (e) {}
+}
+
+// ---------- schedule (same rules as the Android app) ----------
+function coerce(c) {
+  const s = clamp(c.startHour, 0, 22), g = clamp(c.graceMin, 5, 120);
+  return { startHour: s, endHour: clamp(c.endHour, s + 1, 23), intervalMin: clamp(c.intervalMin, 15, 240),
+           snoozeMin: clamp(c.snoozeMin, 5, 30), graceMin: g, missedAfterMin: clamp(c.missedAfterMin, g + 5, 180) };
+}
+function slots(d, c) {
+  const out = [];
+  for (let m = c.startHour * 60; m <= c.endHour * 60; m += c.intervalMin)
+    out.push(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, m).getTime());
+  return out;
+}
+function nextSlot(now, c) {
+  const d = new Date(now);
+  return slots(d, c).find(x => x > now) ??
+    slots(new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1), c)[0];
+}
+
+// ---------- notifications ----------
+function notify(r, followUp) {
+  if (!ready || Notification.permission !== 'granted') return;
+  const [e, l] = T[r.type];
+  ready.then(reg => reg.showNotification(`${e} ${l}`, {
+    body: (followUp ? 'Still waiting: ' : '') + fmt(r.at) + ' reminder',
+    tag: 'r' + r.id, vibrate: [0, 300, 150, 300], icon: 'icon-192.png', badge: 'icon-192.png',
+    actions: [{ action: 'done', title: 'Done' }, { action: 'snooze', title: 'Snooze ' + st.cfg.snoozeMin + ' min' }],
+    data: { id: r.id },
+  }));
+}
+function closeN(id) {
+  ready && ready.then(reg => reg.getNotifications({ tag: 'r' + id }).then(l => l.forEach(n => n.close())));
+}
+
+// ---------- engine: idempotent, safe to run any time ----------
+function reconcile() {
+  const now = Date.now(), c = st.cfg;
+  let ch = false;
+  for (const t of slots(new Date(now), c)) {
+    if (t > now || t < st.track) continue;
+    for (const type of Object.keys(T))
+      if (!st.rows.some(r => r.type === type && r.at === t)) {
+        st.rows.push({ id: st.nid++, type, at: t, status: 'PENDING', doneAt: null, snoozeUntil: null, init: false, follow: false, upd: now });
+        ch = true;
+      }
+  }
+  for (const r of st.rows) {
+    if (!isActive(r)) continue;
+    const fu = r.at + c.graceMin * MIN, ms = r.at + c.missedAfterMin * MIN;
+    if (now >= ms) { r.status = 'MISSED'; r.snoozeUntil = null; closeN(r.id); ch = true; }
+    else if (r.status === 'SNOOZED') {
+      if (now >= r.snoozeUntil) {
+        notify(r, false); r.status = 'PENDING'; r.snoozeUntil = null; r.init = true; r.follow = r.follow || now >= fu; ch = true;
+      }
+    } else if (!r.init) { notify(r, false); r.init = true; r.follow = now >= fu; ch = true; }
+    else if (!r.follow && now >= fu) { notify(r, true); r.follow = true; ch = true; }
+    if (ch) r.upd = now;
+  }
+  if (ch) save();
+}
+function act(id, a) {
+  const r = st.rows.find(x => x.id == id), now = Date.now();
+  if (!r || !isActive(r)) return;
+  if (a === 'done') { r.status = 'CONFIRMED'; r.doneAt = now; r.snoozeUntil = null; navigator.vibrate && navigator.vibrate(40); }
+  else if (a === 'snooze') { r.status = 'SNOOZED'; r.snoozeUntil = now + st.cfg.snoozeMin * MIN; }
+  else return;
+  r.upd = now; closeN(r.id); save(); reconcile(); render();
+}
+function step(key, d) {
+  st.cfg = coerce({ ...st.cfg, [key]: st.cfg[key] + d });
+  st.track = Date.now(); save(); reconcile(); render();
+}
+async function askPermission() {
+  await Notification.requestPermission();
+  reconcile(); render();
+}
+
+// ---------- UI ----------
+const stat = r => ({ CONFIRMED: '✓ Confirmed' + (r.doneAt ? ' · ' + fmt(r.doneAt) : ''), MISSED: '✕ Missed', SNOOZED: '⏸ Snoozed', PENDING: '⏳ Pending' }[r.status]);
+function tab(i) { tabIdx = i; render(); }
+
+function home() {
+  const now = Date.now(), c = st.cfg, d = new Date(now);
+  const ds = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(), de = ds + 864e5;
+  const total = slots(d, c).length, nx = nextSlot(now, c), mins = Math.ceil((nx - now) / MIN);
+  const rem = mins < 1 ? 'less than a minute' : mins < 60 ? mins + ' min remaining' : Math.floor(mins / 60) + ' h ' + (mins % 60) + ' min remaining';
+  const h = d.getHours(), g = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+  const types = Object.keys(T);
+  const cards = types.map(type => {
+    const mine = st.rows.filter(r => r.type === type).sort((a, b) => b.at - a.at);
+    const a = mine.find(isActive), last = mine.find(r => r.status === 'CONFIRMED'), l = mine[0];
+    const s = !a ? (l && l.status === 'CONFIRMED' ? '✓ Completed' : l && l.status === 'MISSED' ? '✕ Missed' : 'No reminder yet')
+      : a.status === 'SNOOZED' ? '⏸ Snoozed until ' + fmt(a.snoozeUntil) : '⏳ Waiting for you';
+    return `<div class="card"><div class="lbl">${T[type][0]} ${T[type][1]}</div>
+      <div class="st">${s}</div>
+      <div class="mut">Last confirmed: ${last ? fmt(last.doneAt) : '—'}</div>
+      <div class="mut">Next: ${fmt(nx)}</div>
+      ${a ? `<div class="row" style="margin-top:12px">
+        <button class="fill flex" onclick="act(${a.id},'done')">Done</button>
+        <button class="flex" onclick="act(${a.id},'snooze')">Snooze ${c.snoozeMin} min</button></div>` : ''}</div>`;
+  }).join('');
+  const prog = types.map(type => {
+    const n = st.rows.filter(r => r.type === type && r.status === 'CONFIRMED' && r.at >= ds && r.at < de).length;
+    return `<div style="margin-top:14px"><div class="row sp"><b>${T[type][0]} ${T[type][1]}</b><b>${n} / ${total}</b></div>
+      <div class="bar" role="img" aria-label="${T[type][1]}: ${n} of ${total} confirmed today"><i style="width:${total ? Math.min(100, n / total * 100) : 0}%"></i></div></div>`;
+  }).join('');
+  const recent = st.rows.filter(r => r.status !== 'PENDING').sort((a, b) => b.upd - a.upd).slice(0, 5)
+    .map(r => `<div>${T[r.type][0]} ${T[r.type][1]} · ${stat(r)}</div>`).join('') || '<div class="mut">Nothing yet. Your first reminder will show up here.</div>';
+  const perm = 'Notification' in window ? Notification.permission : 'denied';
+  return `<h1>${g} 👋</h1><div class="mut">${fmt(now)}</div>
+    ${perm !== 'granted' ? `<div class="card warn"><b>Turn on notifications</b><div class="mut">Reminders cannot alert you without this.</div>
+      <button class="fill" style="margin-top:10px" onclick="askPermission()">Enable notifications</button></div>` : ''}
+    <div class="next" aria-label="Next reminder at ${fmt(nx)}, ${rem}"><div class="lbl">Next reminder</div>
+      <div class="big">${new Date(nx).getDate() !== d.getDate() ? 'Tomorrow ' : ''}${fmt(nx)}</div><div>${rem}</div></div>
+    ${cards}
+    <div class="card"><div class="lbl">Today</div>${prog}</div>
+    <div class="card"><div class="lbl">Recent activity</div><div style="margin-top:8px">${recent}</div></div>
+    <p class="mut" style="font-size:13px">Web version: reminders only fire while this page is still alive in the background. Keep it open or installed to the home screen. GotU is a reminder tool, not medical advice.</p>`;
+}
+
+function history() {
+  const byDay = {};
+  [...st.rows].sort((a, b) => b.at - a.at).forEach(r => {
+    const k = new Date(r.at).toDateString();
+    ((byDay[k] = byDay[k] || {})[r.at] = byDay[k][r.at] || []).push(r);
+  });
+  const today = new Date().toDateString(), yest = new Date(Date.now() - 864e5).toDateString();
+  const body = Object.entries(byDay).map(([day, slotsMap]) =>
+    `<div class="lbl" style="margin-top:20px">${day === today ? 'Today' : day === yest ? 'Yesterday' : day}</div>` +
+    Object.entries(slotsMap).sort((a, b) => b[0] - a[0]).map(([t, rs]) =>
+      `<div class="card" style="margin-top:8px;padding:16px;border-radius:16px"><b>${fmt(+t)}</b>` +
+      rs.sort((a, b) => a.type.localeCompare(b.type)).map(r => `<div>${T[r.type][0]} ${T[r.type][1]}: ${stat(r)}</div>`).join('') + '</div>').join('')
+  ).join('') || '<p class="mut">Nothing yet. Reminders appear here as they arrive.</p>';
+  return `<h1>History</h1>${body}`;
+}
+
+function settings() {
+  const c = st.cfg, hl = h => fmt(new Date(2000, 0, 1, h).getTime());
+  const row = (label, val, key, d) => `<div class="row step" style="margin-top:12px"><span style="flex:1">${label}</span>
+    <button aria-label="Decrease ${label}" onclick="step('${key}',${-d})">−</button><b>${val}</b>
+    <button aria-label="Increase ${label}" onclick="step('${key}',${d})">+</button></div>`;
+  const perm = 'Notification' in window ? Notification.permission : 'denied';
+  return `<h1>Settings</h1>
+    <div class="card"><div class="lbl">Schedule</div>
+      ${row('Start', hl(c.startHour), 'startHour', 1)}${row('End', hl(c.endHour), 'endHour', 1)}${row('Every', c.intervalMin + ' min', 'intervalMin', 15)}</div>
+    <div class="card"><div class="lbl">If there is no response</div>
+      ${row('Snooze', c.snoozeMin + ' min', 'snoozeMin', 5)}${row('Follow-up after', c.graceMin + ' min', 'graceMin', 5)}${row('Mark missed after', c.missedAfterMin + ' min', 'missedAfterMin', 5)}</div>
+    <div class="card"><div class="lbl">Reliability</div>
+      <p>${perm === 'granted' ? '✓' : '⚠'} Notifications ${perm === 'granted' ? '' : '<button onclick="askPermission()">Fix</button>'}</p>
+      <p class="mut" style="font-size:14px">In Chrome: menu → Add to Home screen. Then in phone Settings → Apps → GotU / Chrome → Battery → Unrestricted, so Android does not pause the page.</p></div>`;
+}
+
+function render() {
+  document.getElementById('app').innerHTML = [home, history, settings][tabIdx]();
+  [0, 1, 2].forEach(i => document.getElementById('t' + i).className = i === tabIdx ? 'on' : '');
+}
+
+// ---------- start ----------
+if (ready) {
+  navigator.serviceWorker.register('sw.js');
+  navigator.serviceWorker.addEventListener('message', e => act(e.data.id, e.data.act));
+}
+const q = new URLSearchParams(location.search);
+reconcile(); render();
+if (q.get('act')) { act(q.get('id'), q.get('act')); history.replaceState(null, '', location.pathname); }
+setInterval(() => { reconcile(); render(); }, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { reconcile(); render(); } });
+</script>
+</body>
+</html>
