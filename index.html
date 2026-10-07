@@ -42,6 +42,7 @@ nav button.on{color:var(--pri);font-weight:700}
   <button id="t1" onclick="tab(1)">🕘<br>History</button>
   <button id="t2" onclick="tab(2)">⚙️<br>Settings</button>
 </nav>
+<script src="config.js"></script>
 <script>
 const MIN = 6e4, KEY = 'gotu.v1';
 const T = { WATER: ['💧', 'Water'], EYE_DROPS: ['👁', 'Eye Drops'] };
@@ -51,21 +52,26 @@ const fmt = t => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '
 const isActive = r => r.status === 'PENDING' || r.status === 'SNOOZED';
 const ready = 'serviceWorker' in navigator ? navigator.serviceWorker.ready : null;
 
-let st, tabIdx = 0;
-try { st = JSON.parse(localStorage[KEY]); } catch (e) {}
-st = st || { cfg: { ...DEF }, track: Date.now(), rows: [], nid: 1 };
-function save() {
-  const old = Date.now() - 14 * 864e5;
-  st.rows = st.rows.filter(r => r.at > old);
-  try { localStorage[KEY] = JSON.stringify(st); } catch (e) {}
-}
+const API = (window.GOTU_API || '').replace(/\/$/, '');
+const configured = API && !API.includes('YOURNAME');
+const CACHE_KEY = 'gotu.cache';
+const hex = () => [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+const uid = (() => { try { return localStorage['gotu.uid'] || (localStorage['gotu.uid'] = hex()); } catch (e) { return hex(); } })();
+const b64u = {
+  enc: b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
+};
 
-// ---------- schedule (same rules as the Android app) ----------
+// The server owns the schedule and the reminder states. This page is a display plus Done/Snooze buttons.
+let st = { cfg: { ...DEF }, rows: [], sub: false }, tabIdx = 0, offline = false, stepTimer;
+try { st = JSON.parse(localStorage[CACHE_KEY]) || st; } catch (e) {}
+
 function coerce(c) {
   const s = clamp(c.startHour, 0, 22), g = clamp(c.graceMin, 5, 120);
   return { startHour: s, endHour: clamp(c.endHour, s + 1, 23), intervalMin: clamp(c.intervalMin, 15, 240),
            snoozeMin: clamp(c.snoozeMin, 5, 30), graceMin: g, missedAfterMin: clamp(c.missedAfterMin, g + 5, 180) };
 }
+// Only used for the countdown and the "x / y today" total (same rule as the server).
 function slots(d, c) {
   const out = [];
   for (let m = c.startHour * 60; m <= c.endHour * 60; m += c.intervalMin)
@@ -78,62 +84,56 @@ function nextSlot(now, c) {
     slots(new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1), c)[0];
 }
 
-// ---------- notifications ----------
-function notify(r, followUp) {
-  if (!ready || Notification.permission !== 'granted') return;
-  const [e, l] = T[r.type];
-  ready.then(reg => reg.showNotification(`${e} ${l}`, {
-    body: (followUp ? 'Still waiting: ' : '') + fmt(r.at) + ' reminder',
-    tag: 'r' + r.id, vibrate: [0, 300, 150, 300], icon: 'icon-192.png', badge: 'icon-192.png',
-    actions: [{ action: 'done', title: 'Done' }, { action: 'snooze', title: 'Snooze ' + st.cfg.snoozeMin + ' min' }],
-    data: { id: r.id },
-  }));
+async function call(op, body) {
+  const r = await fetch(`${API}/${uid}/${op}`, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(r.status);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j;
 }
-function closeN(id) {
-  ready && ready.then(reg => reg.getNotifications({ tag: 'r' + id }).then(l => l.forEach(n => n.close())));
+function apply(s) {
+  st = s; offline = false;
+  try { localStorage[CACHE_KEY] = JSON.stringify(s); } catch (e) {}
+  render();
 }
-
-// ---------- engine: idempotent, safe to run any time ----------
-function reconcile() {
-  const now = Date.now(), c = st.cfg;
-  let ch = false;
-  for (const t of slots(new Date(now), c)) {
-    if (t > now || t < st.track) continue;
-    for (const type of Object.keys(T))
-      if (!st.rows.some(r => r.type === type && r.at === t)) {
-        st.rows.push({ id: st.nid++, type, at: t, status: 'PENDING', doneAt: null, snoozeUntil: null, init: false, follow: false, upd: now });
-        ch = true;
-      }
-  }
-  for (const r of st.rows) {
-    if (!isActive(r)) continue;
-    const fu = r.at + c.graceMin * MIN, ms = r.at + c.missedAfterMin * MIN;
-    if (now >= ms) { r.status = 'MISSED'; r.snoozeUntil = null; closeN(r.id); ch = true; }
-    else if (r.status === 'SNOOZED') {
-      if (now >= r.snoozeUntil) {
-        notify(r, false); r.status = 'PENDING'; r.snoozeUntil = null; r.init = true; r.follow = r.follow || now >= fu; ch = true;
-      }
-    } else if (!r.init) { notify(r, false); r.init = true; r.follow = now >= fu; ch = true; }
-    else if (!r.follow && now >= fu) { notify(r, true); r.follow = true; ch = true; }
-    if (ch) r.upd = now;
-  }
-  if (ch) save();
+async function sync(extra) {
+  if (!configured) return;
+  try {
+    const reg = ready && await ready;
+    const sub = reg && await reg.pushManager.getSubscription();
+    apply(await call('sync', { tz: Intl.DateTimeFormat().resolvedOptions().timeZone, sub: sub ? sub.toJSON() : undefined, ...extra }));
+  } catch (e) { offline = true; render(); }
 }
-function act(id, a) {
-  const r = st.rows.find(x => x.id == id), now = Date.now();
-  if (!r || !isActive(r)) return;
-  if (a === 'done') { r.status = 'CONFIRMED'; r.doneAt = now; r.snoozeUntil = null; navigator.vibrate && navigator.vibrate(40); }
-  else if (a === 'snooze') { r.status = 'SNOOZED'; r.snoozeUntil = now + st.cfg.snoozeMin * MIN; }
-  else return;
-  r.upd = now; closeN(r.id); save(); reconcile(); render();
+async function askPermission() {
+  try {
+    if (await Notification.requestPermission() !== 'granted') return render();
+    const reg = await ready, { key } = await call('vapid');
+    let sub = await reg.pushManager.getSubscription();
+    if (sub && b64u.enc(sub.options.applicationServerKey) !== key) { await sub.unsubscribe(); sub = null; }
+    if (!sub) await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64u.dec(key) });
+    await sync();
+  } catch (e) { alert('Could not turn on notifications: ' + e.message); }
+}
+async function act(id, a) {
+  const r = st.rows.find(x => x.id === id);
+  if (!r) return;
+  const before = JSON.stringify(st);
+  r.status = a === 'done' ? 'CONFIRMED' : 'SNOOZED'; // show it instantly, the server confirms
+  if (a === 'done') { r.doneAt = Date.now(); navigator.vibrate && navigator.vibrate(40); }
+  else r.snoozeUntil = Date.now() + st.cfg.snoozeMin * MIN;
+  render();
+  try { apply(await call('act', { id, act: a })); }
+  catch (e) { st = JSON.parse(before); offline = true; render(); alert('No internet, so that was not saved. Please try again.'); }
 }
 function step(key, d) {
   st.cfg = coerce({ ...st.cfg, [key]: st.cfg[key] + d });
-  st.track = Date.now(); save(); reconcile(); render();
-}
-async function askPermission() {
-  await Notification.requestPermission();
-  reconcile(); render();
+  render();
+  clearTimeout(stepTimer);
+  stepTimer = setTimeout(() => sync({ cfg: st.cfg }), 600); // one request after the last tap
 }
 
 // ---------- UI ----------
@@ -167,16 +167,17 @@ function home() {
   }).join('');
   const recent = st.rows.filter(r => r.status !== 'PENDING').sort((a, b) => b.upd - a.upd).slice(0, 5)
     .map(r => `<div>${T[r.type][0]} ${T[r.type][1]} · ${stat(r)}</div>`).join('') || '<div class="mut">Nothing yet. Your first reminder will show up here.</div>';
-  const perm = 'Notification' in window ? Notification.permission : 'denied';
-  return `<h1>${g} 👋</h1><div class="mut">${fmt(now)}</div>
-    ${perm !== 'granted' ? `<div class="card warn"><b>Turn on notifications</b><div class="mut">Reminders cannot alert you without this.</div>
+  const needPerm = !('Notification' in window) || Notification.permission !== 'granted' || !st.sub;
+  return `<h1>${g} 👋</h1><div class="mut">${fmt(now)}${offline ? ' · offline, showing last saved data' : ''}</div>
+    ${!configured ? `<div class="card warn"><b>Server not connected</b><div class="mut">Reminders cannot be sent until the server address is set in config.js.</div></div>` : ''}
+    ${configured && needPerm ? `<div class="card warn"><b>Turn on notifications</b><div class="mut">Reminders cannot alert you without this.</div>
       <button class="fill" style="margin-top:10px" onclick="askPermission()">Enable notifications</button></div>` : ''}
     <div class="next" aria-label="Next reminder at ${fmt(nx)}, ${rem}"><div class="lbl">Next reminder</div>
       <div class="big">${new Date(nx).getDate() !== d.getDate() ? 'Tomorrow ' : ''}${fmt(nx)}</div><div>${rem}</div></div>
     ${cards}
     <div class="card"><div class="lbl">Today</div>${prog}</div>
     <div class="card"><div class="lbl">Recent activity</div><div style="margin-top:8px">${recent}</div></div>
-    <p class="mut" style="font-size:13px">Web version: reminders only fire while this page is still alive in the background. Keep it open or installed to the home screen. GotU is a reminder tool, not medical advice.</p>`;
+    <p class="mut" style="font-size:13px">Reminders are sent by the server, so they arrive even when this page is closed. GotU is a reminder tool, not medical advice.</p>`;
 }
 
 function history() {
@@ -207,8 +208,8 @@ function settings() {
     <div class="card"><div class="lbl">If there is no response</div>
       ${row('Snooze', c.snoozeMin + ' min', 'snoozeMin', 5)}${row('Follow-up after', c.graceMin + ' min', 'graceMin', 5)}${row('Mark missed after', c.missedAfterMin + ' min', 'missedAfterMin', 5)}</div>
     <div class="card"><div class="lbl">Reliability</div>
-      <p>${perm === 'granted' ? '✓' : '⚠'} Notifications ${perm === 'granted' ? '' : '<button onclick="askPermission()">Fix</button>'}</p>
-      <p class="mut" style="font-size:14px">In Chrome: menu → Add to Home screen. Then in phone Settings → Apps → GotU / Chrome → Battery → Unrestricted, so Android does not pause the page.</p></div>`;
+      <p>${perm === 'granted' && st.sub ? '✓' : '⚠'} Notifications ${perm === 'granted' && st.sub ? '' : '<button onclick="askPermission()">Fix</button>'}</p>
+      <p class="mut" style="font-size:14px">Also set phone Settings → Apps → Chrome → Battery → Unrestricted, and do not force-stop Chrome. Android can delay notifications for force-stopped apps.</p></div>`;
 }
 
 function render() {
@@ -219,13 +220,12 @@ function render() {
 // ---------- start ----------
 if (ready) {
   navigator.serviceWorker.register('sw.js');
-  navigator.serviceWorker.addEventListener('message', e => act(e.data.id, e.data.act));
+  navigator.serviceWorker.addEventListener('message', e => e.data && e.data.refresh && sync());
 }
-const q = new URLSearchParams(location.search);
-reconcile(); render();
-if (q.get('act')) { act(q.get('id'), q.get('act')); history.replaceState(null, '', location.pathname); }
-setInterval(() => { reconcile(); render(); }, 15000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { reconcile(); render(); } });
+render();
+sync();
+setInterval(render, 15000); // countdown only, no network
+document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(); });
 </script>
 </body>
 </html>
