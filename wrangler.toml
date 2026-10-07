@@ -1,0 +1,11 @@
+name = "gotu-api"
+main = "src/index.js"
+compatibility_date = "2025-10-01"
+
+[[durable_objects.bindings]]
+name = "GOTU"
+class_name = "GotuUser"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GotuUser"]
