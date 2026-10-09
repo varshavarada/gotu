@@ -1,0 +1,15 @@
+# Second deployment of the same code, water reminders only.
+name = "gotu-water-api"
+main = "src/index.js"
+compatibility_date = "2025-10-01"
+
+[vars]
+TYPES = "WATER"
+
+[[durable_objects.bindings]]
+name = "GOTU"
+class_name = "GotuUser"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GotuUser"]

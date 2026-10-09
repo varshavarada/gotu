@@ -131,3 +131,22 @@ test('changing the schedule never invents past missed reminders', async () => {
   assert.ok(rows.filter(r => r.at >= ist(12, 10)).every(r => r.status === 'PENDING'));
   assert.ok(!rows.some(r => r.at === ist(11, 30)));
 });
+
+test('water-only deployment (TYPES=WATER) creates and pushes only water, with its own follow-up and missed', async () => {
+  const st = new FakeStorage(), obj = new GotuUser({ storage: st }, { TYPES: 'WATER' }), dev = await device(), sent = [];
+  globalThis.fetch = async (url, init) => { sent.push(init); return { status: 201 }; };
+  const uid = 'd'.repeat(32);
+  await obj.vapid(uid, ist(9, 50));
+  await obj.sync(uid, { tz: 'Asia/Kolkata', sub: dev.sub }, 'https://api.test', ist(9, 50));
+  await obj.tick(ist(10));
+  let p = await Promise.all(sent.map(x => decrypt(dev, x.body)));
+  assert.deepEqual(p.map(x => [x.type, x.followUp]), [['WATER', false]]);
+  await obj.tick(ist(10, 15));
+  p = await Promise.all(sent.map(x => decrypt(dev, x.body)));
+  assert.deepEqual(p.map(x => [x.type, x.followUp]), [['WATER', false], ['WATER', true]]);
+  await obj.tick(ist(10, 30));
+  const rows = (await st.get('u')).rows;
+  assert.deepEqual(rows.map(r => [r.type, r.status]), [['WATER', 'MISSED']]);
+  assert.equal(sent.length, 2);
+  assert.equal(st.alarm, ist(11));
+});

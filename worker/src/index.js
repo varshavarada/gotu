@@ -3,7 +3,7 @@
 import { newVapid, sendPush } from './push.js';
 
 const MIN = 60000;
-const TYPES = ['WATER', 'EYE_DROPS'];
+const ALL_TYPES = ['WATER', 'EYE_DROPS'];
 const DEF = { startHour: 8, endHour: 22, intervalMin: 60, snoozeMin: 10, graceMin: 15, missedAfterMin: 30 };
 // Only real push services, so the server can't be pointed at arbitrary URLs.
 const PUSH_HOSTS = /^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|[\w.-]+\.push\.apple\.com|[\w.-]+\.notify\.windows\.com)$/;
@@ -60,9 +60,12 @@ export default {
 };
 
 export class GotuUser {
-  constructor(state) {
+  constructor(state, env) {
     this.s = state.storage;
     this.q = Promise.resolve();
+    // Which reminders this deployment sends, e.g. TYPES="WATER" for a water-only app.
+    const wanted = String((env && env.TYPES) || '').split(',').map(t => t.trim()).filter(t => ALL_TYPES.includes(t));
+    this.types = wanted.length ? wanted : ALL_TYPES;
   }
   lock(fn) { const r = this.q.then(fn); this.q = r.catch(() => {}); return r; } // one job at a time
 
@@ -118,7 +121,7 @@ export class GotuUser {
     const ping = (r, fu) => { if (u.sub) sends.push({ r, fu }); };
     for (const t of daySlots(...today(now, u.tz), c, u.tz)) {
       if (t > now || t < u.track) continue;
-      for (const type of TYPES)
+      for (const type of this.types)
         if (!u.rows.some(r => r.type === type && r.at === t))
           u.rows.push({ id: u.nid++, type, at: t, status: 'PENDING', doneAt: null, snoozeUntil: null, init: false, follow: false, upd: now });
     }
