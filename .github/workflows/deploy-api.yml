@@ -13,8 +13,16 @@ jobs:
         with:
           node-version: 22
       - run: node --test worker/test.mjs
-      - uses: cloudflare/wrangler-action@v3
+      - name: Deploy GotU (water + eye drops)
+        uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: worker
+      - name: Deploy GotU Water (water only)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy -c wrangler.water.toml
